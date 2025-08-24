@@ -2,15 +2,18 @@ import logging
 import asyncio
 import sys
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
+from aiogram.filters import Command, ChatType
 from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.types import ErrorEvent
+from aiogram.exceptions import TelegramForbiddenError
 
 from config import Config
 from storage import user_levels, set_user_level, init_punishment_system, load_initial_data, cleanup_old_data
+from storage import get_system_health, get_cache_stats, process_message_queue
 from database import init_database, db
-from filters import RateLimitFilter
-from handlers import send_error_log
+from redis_storage import redis_storage
+from filters import RateLimitFilter, IsPrivateOrOwnerAdmin, IsOwnerAnywhere, IsOwnerAndAdmin
+from handlers import send_error_log, handle_permission_error
 
 # Импорты команд
 from commands import (
@@ -18,7 +21,7 @@ from commands import (
     cmd_getid, cmd_help, cmd_stats, cmd_users, cmd_mods,
     cmd_settings, cmd_backup, cmd_status, cmd_emergency,
     cmd_reports, handle_cancel, handle_new_message, handle_admin_callback,
-    register_commands  # Новая функция для регистрации команд
+    register_commands, cmd_mystats, cmd_system
 )
 
 from handlers import (
@@ -48,24 +51,35 @@ async def background_tasks():
         try:
             # Очистка старых данных из базы
             cleanup_old_data()
-            logger.info("✅ Фоновая очистка данных выполнена")
+            
+            # Обработка очереди сообщений
+            processed = process_message_queue()
+            if processed > 0:
+                logger.info(f"✅ Обработано {processed} сообщений из очереди")
             
             # Проверка соединения с базой данных
-            if db and not db.connection.is_connected():
+            if db and (not hasattr(db, 'connection') or not db.connection.is_connected()):
                 logger.warning("📡 Переподключение к MySQL...")
                 db.connect()
             
-            await asyncio.sleep(3600)  # Каждый час
+            # Логирование состояния системы
+            health = get_system_health()
+            if health.get('database', {}).get('status') == 'online':
+                logger.debug("✅ Система в норме")
+            else:
+                logger.warning("⚠️  Проблемы с подключением к БД")
+            
+            await asyncio.sleep(300)  # Каждые 5 минут
         
         except Exception as e:
             logger.error(f"Ошибка в фоновой задаче: {e}")
-            await asyncio.sleep(300)  # Ждем 5 минут при ошибке
+            await asyncio.sleep(60)
 
 async def database_health_check():
     """Проверка здоровья базы данных"""
     while True:
         try:
-            if db and db.connection.is_connected():
+            if db and hasattr(db, 'connection') and db.connection.is_connected():
                 # Простая проверка запросом
                 with db.get_cursor() as cursor:
                     cursor.execute("SELECT 1")
@@ -78,6 +92,20 @@ async def database_health_check():
         except Exception as e:
             logger.error(f"Ошибка проверки здоровья БД: {e}")
             await asyncio.sleep(60)
+
+async def cache_cleanup_task():
+    """Задача очистки кэша"""
+    while True:
+        try:
+            # Очищаем старые кэши раз в час
+            cache_stats = get_cache_stats()
+            logger.info(f"📊 Статистика кэша: {cache_stats}")
+            
+            await asyncio.sleep(3600)  # Каждый час
+            
+        except Exception as e:
+            logger.error(f"Ошибка задачи очистки кэша: {e}")
+            await asyncio.sleep(300)
 
 async def startup_tasks():
     """Задачи выполняемые при запуске бота"""
@@ -104,13 +132,20 @@ async def startup_tasks():
         logger.info("✅ Очистка старых данных выполнена")
     except Exception as e:
         logger.error(f"❌ Ошибка очистки данных: {e}")
+    
+    # Проверка здоровья системы
+    try:
+        health = get_system_health()
+        logger.info(f"🏥 Статус системы: {health}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка проверки здоровья системы: {e}")
 
 async def shutdown_tasks():
     """Задачи выполняемые при выключении бота"""
     logger.info("🛑 Выполнение задач выключения...")
     
     # Закрытие соединения с базой
-    if db:
+    if db and hasattr(db, 'connection'):
         db.disconnect()
         logger.info("✅ Соединение с базой данных закрыто")
     
@@ -118,6 +153,13 @@ async def shutdown_tasks():
     if 'punishment_system' in globals():
         await punishment_system.stop()
         logger.info("✅ Система наказаний остановлена")
+    
+    # Сохранение кэша
+    try:
+        cache_stats = get_cache_stats()
+        logger.info(f"💾 Финальная статистика кэша: {cache_stats}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка сохранения статистики кэша: {e}")
 
 async def main():
     try:
@@ -152,57 +194,77 @@ async def main():
         
         # Регистрируем обработчики ошибок
         dp.errors.register(global_error_handler)
+        dp.errors.register(handle_permission_error, ExceptionTypeFilter(TelegramForbiddenError))
         
-        # Регистрируем основные команды
-        dp.message.register(cmd_start, Command("start"))
-        dp.message.register(cmd_pending, Command("pending"))
-        dp.message.register(cmd_checkprofile, Command("checkprofile"))
-        dp.message.register(cmd_setlevel, Command("setlevel"))
-        dp.message.register(cmd_getid, Command("getid"))
-        dp.message.register(cmd_help, Command("help"))
-        dp.message.register(cmd_stats, Command("stats"))
-        dp.message.register(cmd_users, Command("users"))
-        dp.message.register(cmd_mods, Command("mods"))
-        dp.message.register(cmd_settings, Command("settings"))
-        dp.message.register(cmd_backup, Command("backup"))
-        dp.message.register(cmd_status, Command("status"))
-        dp.message.register(cmd_emergency, Command("emergency"))
-        dp.message.register(cmd_reports, Command("reports"))
-
+        # ==================== РЕГИСТРАЦИЯ КОМАНД С ФИЛЬТРАМИ ====================
+        
+        # Команды для всех пользователей (только в личных сообщениях)
+        user_filter = IsPrivateOrOwnerAdmin()
+        
+        dp.message.register(cmd_start, Command("start") & user_filter)
+        dp.message.register(cmd_getid, Command("getid") & user_filter)
+        dp.message.register(cmd_help, Command("help") & user_filter)
+        dp.message.register(cmd_mystats, Command("mystats") & user_filter)
+        
+        # Кнопки (только в личных сообщениях)
+        dp.message.register(handle_cancel, F.text == "✖️ Отменить" & user_filter)
+        dp.message.register(handle_new_message, F.text == "✍️ Написать анонимное сообщение" & user_filter)
+        
+        # Команды для модераторов (только в личных сообщениях)
+        moderator_filter = IsPrivateOrOwnerAdmin()
+        dp.message.register(cmd_pending, Command("pending") & moderator_filter)
+        
+        # Команды для технических модераторов (только в личных сообщениях)
+        tech_moderator_filter = IsPrivateOrOwnerAdmin()
+        dp.message.register(cmd_checkprofile, Command("checkprofile") & tech_moderator_filter)
+        
+        # Команды для владельца (везде где бот админ)
+        owner_filter = IsOwnerAnywhere()
+        
+        dp.message.register(cmd_setlevel, Command("setlevel") & owner_filter)
+        dp.message.register(cmd_stats, Command("stats") & owner_filter)
+        dp.message.register(cmd_users, Command("users") & owner_filter)
+        dp.message.register(cmd_mods, Command("mods") & owner_filter)
+        dp.message.register(cmd_settings, Command("settings") & owner_filter)
+        dp.message.register(cmd_backup, Command("backup") & owner_filter)
+        dp.message.register(cmd_status, Command("status") & owner_filter)
+        dp.message.register(cmd_emergency, Command("emergency") & owner_filter)
+        dp.message.register(cmd_reports, Command("reports") & owner_filter)
+        dp.message.register(cmd_system, Command("system") & owner_filter)
+        
         # Регистрируем дополнительные команды
         register_commands(dp)
-
-        # Обработчики сообщений
-        dp.message.register(handle_cancel, F.text == "✖️ Отменить")
-        dp.message.register(handle_new_message, F.text == "✍️ Написать анонимное сообщение")
-
-        # Обработчики контента с rate limiting
+        
+        # Обработчики контента с rate limiting (только в личных сообщениях)
         rate_limit = RateLimitFilter(limit=5, period=60)
-        dp.message.register(handle_text_message, F.text & rate_limit)
-        dp.message.register(handle_photo_message, F.photo & rate_limit)
-        dp.message.register(handle_video_message, F.video & rate_limit)
-        dp.message.register(handle_voice_message, F.voice & rate_limit)
-        dp.message.register(handle_video_note_message, F.video_note & rate_limit)
-        dp.message.register(handle_sticker_message, F.sticker & rate_limit)
-        dp.message.register(handle_document_message, F.document & rate_limit)
-
-        # Обработчики callback'ов
+        content_filter = IsPrivateOrOwnerAdmin()
+        
+        dp.message.register(handle_text_message, F.text & rate_limit & content_filter)
+        dp.message.register(handle_photo_message, F.photo & rate_limit & content_filter)
+        dp.message.register(handle_video_message, F.video & rate_limit & content_filter)
+        dp.message.register(handle_voice_message, F.voice & rate_limit & content_filter)
+        dp.message.register(handle_video_note_message, F.video_note & rate_limit & content_filter)
+        dp.message.register(handle_sticker_message, F.sticker & rate_limit & content_filter)
+        dp.message.register(handle_document_message, F.document & rate_limit & content_filter)
+        
+        # Обработчики callback'ов (везде)
         dp.callback_query.register(handle_moderation, F.data.startswith("approve_") | F.data.startswith("reject_"))
         dp.callback_query.register(handle_punishment_callback, F.data.startswith("mute_") | F.data.startswith("warn_") | F.data.startswith("ban_"))
         dp.callback_query.register(handle_admin_callback, F.data.startswith("users_") | F.data.startswith("mods_") | 
                                   F.data.startswith("setting_") | F.data.startswith("backup_") | 
                                   F.data.startswith("emergency_") | F.data.startswith("report_"))
-
+        
         dp.message.register(handle_punishment_reason, PunishmentStates.waiting_for_reason)
-
+        
         # Запускаем фоновые задачи
         asyncio.create_task(background_tasks())
         asyncio.create_task(database_health_check())
+        asyncio.create_task(cache_cleanup_task())
         
         logger.info("🤖 Бот запущен успешно!")
-        logger.info(f"📊 Пользователей в памяти: {len(user_levels)}")
-        logger.info(f"📨 Сообщений в очереди: {len(getattr(storage, 'pending_messages', {}))}")
-        logger.info(f"🗄️  База данных: {Config.MYSQL_DATABASE} на {Config.MYSQL_HOST}")
+        logger.info("🔐 Система прав доступа активирована:")
+        logger.info("   👤 Пользователи: команды только в личных сообщениях")
+        logger.info("   👑 Владелец: команды везде где бот админ")
         
         # Запускаем поллинг
         await dp.start_polling(bot)
