@@ -3,14 +3,15 @@ import asyncio
 import sys
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.types import ErrorEvent
 
 from config import Config
-from storage import user_levels, set_user_level, init_punishment_system
-from webhooks import webhook_system
+from storage import user_levels, set_user_level, init_punishment_system, load_initial_data
+from filters import RateLimitFilter
 from handlers import send_error_log
 
+# Импорты команд
 from commands import (
     cmd_start, cmd_pending, cmd_checkprofile, cmd_setlevel, 
     cmd_getid, cmd_help, cmd_stats, cmd_users, cmd_mods,
@@ -28,7 +29,10 @@ from handlers import (
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.FileHandler('bot.log', encoding='utf-8')]
+    handlers=[
+        logging.FileHandler('bot.log', encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -36,23 +40,41 @@ async def global_error_handler(event: ErrorEvent):
     logger.error(f"Global error: {event.exception}", exc_info=event.exception)
     await send_error_log("Global Error", str(event.exception))
 
+async def background_tasks():
+    """Фоновые задачи"""
+    while True:
+        try:
+            # Здесь можно добавить периодические задачи
+            # например, очистку кэша, проверку здоровья и т.д.
+            await asyncio.sleep(300)  # Каждые 5 минут
+        except Exception as e:
+            logger.error(f"Background task error: {e}")
+            await asyncio.sleep(60)
+
 async def main():
     try:
         Config.validate()
         
+        # Используем Redis вместо MemoryStorage
+        storage = RedisStorage.from_url('redis://localhost:6379/0')
         bot = Bot(token=Config.BOT_TOKEN)
-        storage = MemoryStorage()
         dp = Dispatcher(storage=storage)
         
+        # Загружаем данные из Redis
+        load_initial_data()
+        
+        # Инициализируем системы
         punishment_system = init_punishment_system(bot)
-        await webhook_system.init()
         await punishment_system.start()
         
+        # Устанавливаем уровни пользователей
         set_user_level(Config.MODERATOR_ID, 1)
         set_user_level(Config.OWNER_ID, 3)
         
+        # Регистрируем обработчики
         dp.errors.register(global_error_handler)
         
+        # Команды
         dp.message.register(cmd_start, Command("start"))
         dp.message.register(cmd_pending, Command("pending"))
         dp.message.register(cmd_checkprofile, Command("checkprofile"))
@@ -68,17 +90,21 @@ async def main():
         dp.message.register(cmd_emergency, Command("emergency"))
         dp.message.register(cmd_reports, Command("reports"))
 
+        # Обработчики сообщений
         dp.message.register(handle_cancel, F.text == "✖️ Отменить")
         dp.message.register(handle_new_message, F.text == "✍️ Написать анонимное сообщение")
 
-        dp.message.register(handle_text_message, F.text)
-        dp.message.register(handle_photo_message, F.photo)
-        dp.message.register(handle_video_message, F.video)
-        dp.message.register(handle_voice_message, F.voice)
-        dp.message.register(handle_video_note_message, F.video_note)
-        dp.message.register(handle_sticker_message, F.sticker)
-        dp.message.register(handle_document_message, F.document)
+        # Обработчики контента с rate limiting
+        rate_limit = RateLimitFilter(limit=5, period=60)
+        dp.message.register(handle_text_message, F.text & rate_limit)
+        dp.message.register(handle_photo_message, F.photo & rate_limit)
+        dp.message.register(handle_video_message, F.video & rate_limit)
+        dp.message.register(handle_voice_message, F.voice & rate_limit)
+        dp.message.register(handle_video_note_message, F.video_note & rate_limit)
+        dp.message.register(handle_sticker_message, F.sticker & rate_limit)
+        dp.message.register(handle_document_message, F.document & rate_limit)
 
+        # Обработчики callback'ов
         dp.callback_query.register(handle_moderation, F.data.startswith("approve_") | F.data.startswith("reject_"))
         dp.callback_query.register(handle_punishment_callback, F.data.startswith("mute_") | F.data.startswith("warn_") | F.data.startswith("ban_"))
         dp.callback_query.register(handle_admin_callback, F.data.startswith("users_") | F.data.startswith("mods_") | 
@@ -87,14 +113,18 @@ async def main():
 
         dp.message.register(handle_punishment_reason, PunishmentStates.waiting_for_reason)
 
+        # Запускаем фоновые задачи
+        asyncio.create_task(background_tasks())
+        
         logger.info("Бот запущен успешно!")
-        logger.info(f"API сервер доступен на http://{Config.API_HOST}:{Config.API_PORT}")
+        logger.info(f"Используется Redis storage")
         
         await dp.start_polling(bot)
         
     except Exception as e:
         logger.critical(f"Failed to start bot: {e}")
-        await webhook_system.close()
+        if 'punishment_system' in locals():
+            await punishment_system.stop()
         sys.exit(1)
 
 if __name__ == "__main__":
