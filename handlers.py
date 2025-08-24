@@ -4,14 +4,16 @@ import traceback
 from aiogram import types, F
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
+from aiogram.exceptions import TelegramForbiddenError
 
 from config import Config
 from storage import (
     add_message, get_message, delete_message, user_levels, 
-    update_moderator_stats, add_warning, add_punishment, can_send_message
+    update_moderator_stats, add_warning, add_punishment, can_send_message,
+    get_user_level, update_message_status
 )
 from keyboards import create_moderation_keyboard
-from commands import get_cancel_keyboard, get_start_keyboard
+from commands import get_cancel_keyboard, get_start_keyboard, check_command_access
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,22 @@ async def send_error_log(context: str, error: str, traceback_info: str = ""):
         logger.error(f"Failed to send error log: {e}")
 
 @error_handler
+async def handle_permission_error(event: types.ErrorEvent):
+    """Обработчик ошибок прав доступа"""
+    if isinstance(event.exception, TelegramForbiddenError):
+        # Бот не имеет прав в этом чате
+        try:
+            if hasattr(event.update, 'message') and event.update.message:
+                await event.update.message.answer(
+                    "❌ У меня нет прав администратора в этом чате. "
+                    "Пожалуйста, предоставьте необходимые права или используйте команды в личных сообщениях."
+                )
+        except:
+            pass
+        return True
+    return False
+
+@error_handler
 async def send_moderation_log(moderator_username: str, moderator_id: int, message_content: str, message_id: int, user_username: str, approved: bool):
     try:
         status_emoji = "✅" if approved else "❌"
@@ -99,7 +117,6 @@ async def send_to_owner_channel(message: types.Message, message_id: int, content
         owner_text = f"📬 Отправитель: @{message.from_user.username or 'без username'}\n\n"
         
         if content_type == "text":
-            from config import Config
             if len(message.text) > Config.MAX_MESSAGE_LENGTH:
                 owner_text += f"📝 Сообщение ({len(message.text)} символов):\n"
                 owner_text += f"{message.text[:200]}..."
@@ -109,38 +126,12 @@ async def send_to_owner_channel(message: types.Message, message_id: int, content
             owner_text += f"📷 Фото"
             if message.caption:
                 owner_text += f"\n\n{message.caption}"
-        elif content_type == "video":
-            owner_text += f"🎥 Видео"
-            if message.caption:
-                owner_text += f"\n\n{message.caption}"
-        elif content_type == "voice":
-            owner_text += f"🎵 Голосовое сообщение"
-        elif content_type == "video_note":
-            owner_text += f"📹 Видеосообщение"
-        elif content_type == "sticker":
-            owner_text += f"✨ Стикер"
-        elif content_type == "document":
-            owner_text += f"📄 Документ: {message.document.file_name}"
-            if message.caption:
-                owner_text += f"\n\n{message.caption}"
         
         msg = None
         if content_type == "text":
             msg = await message.bot.send_message(Config.OWNER_CHANNEL, owner_text)
         elif content_type == "photo":
             msg = await message.bot.send_photo(Config.OWNER_CHANNEL, message.photo[-1].file_id, caption=owner_text)
-        elif content_type == "video":
-            msg = await message.bot.send_video(Config.OWNER_CHANNEL, message.video.file_id, caption=owner_text)
-        elif content_type == "voice":
-            msg = await message.bot.send_voice(Config.OWNER_CHANNEL, message.voice.file_id, caption=owner_text)
-        elif content_type == "video_note":
-            await message.bot.send_video_note(Config.OWNER_CHANNEL, message.video_note.file_id)
-            msg = await message.bot.send_message(Config.OWNER_CHANNEL, owner_text)
-        elif content_type == "sticker":
-            await message.bot.send_sticker(Config.OWNER_CHANNEL, message.sticker.file_id)
-            msg = await message.bot.send_message(Config.OWNER_CHANNEL, owner_text)
-        elif content_type == "document":
-            msg = await message.bot.send_document(Config.OWNER_CHANNEL, message.document.file_id, caption=owner_text)
         
         return msg.message_id if msg else None
         
@@ -191,6 +182,9 @@ async def update_owner_channel_message(message_id: int, approved: bool, owner_me
 @error_handler
 async def send_to_moderator(message: types.Message, message_id: int, content_type: str):
     try:
+        if not await check_command_access(message):
+            return
+        
         if not can_send_message(message.from_user.id):
             await message.answer("❌ Слишком много сообщений. Подождите немного.", reply_markup=get_cancel_keyboard())
             return
@@ -205,7 +199,6 @@ async def send_to_moderator(message: types.Message, message_id: int, content_typ
         for moderator_id in moderators:
             try:
                 if content_type == "text":
-                    from config import Config
                     if len(message.text) > Config.MAX_MESSAGE_LENGTH:
                         mod_text = f"📨 Сообщение для модерации ({len(message.text)} символов):\n\n"
                         mod_text += f"{message.text[:500]}..."
@@ -235,7 +228,7 @@ async def send_to_moderator(message: types.Message, message_id: int, content_typ
             await message.answer("❌ Не удалось отправить сообщение на модерацию. Попробуйте позже.", reply_markup=get_cancel_keyboard())
             return
         
-        user_level = user_levels.get(message.from_user.id, 0)
+        user_level = get_user_level(message.from_user.id)
         if user_level == 0:
             owner_message_id = await send_to_owner_channel(message, message_id, content_type)
             message_data = get_message(message_id)
@@ -254,13 +247,15 @@ async def handle_text_message(message: types.Message):
     if await handle_buttons(message):
         return
     
-    from config import Config
+    if not await check_command_access(message):
+        return
+    
     if len(message.text) > Config.MAX_MESSAGE_LENGTH:
         await message.answer(f"❌ Сообщение слишком длинное. Максимум {Config.MAX_MESSAGE_LENGTH} символов.", reply_markup=get_cancel_keyboard())
         return
     
     user_id = message.from_user.id
-    user_level = user_levels.get(user_id, 0)
+    user_level = get_user_level(user_id)
     
     message_data = {
         'user_id': user_id,
@@ -279,8 +274,11 @@ async def handle_photo_message(message: types.Message):
     if await handle_buttons(message):
         return
     
+    if not await check_command_access(message):
+        return
+    
     user_id = message.from_user.id
-    user_level = user_levels.get(user_id, 0)
+    user_level = get_user_level(user_id)
     
     message_data = {
         'user_id': user_id,
@@ -300,8 +298,11 @@ async def handle_video_message(message: types.Message):
     if await handle_buttons(message):
         return
     
+    if not await check_command_access(message):
+        return
+    
     user_id = message.from_user.id
-    user_level = user_levels.get(user_id, 0)
+    user_level = get_user_level(user_id)
     
     message_data = {
         'user_id': user_id,
@@ -321,8 +322,11 @@ async def handle_voice_message(message: types.Message):
     if await handle_buttons(message):
         return
     
+    if not await check_command_access(message):
+        return
+    
     user_id = message.from_user.id
-    user_level = user_levels.get(user_id, 0)
+    user_level = get_user_level(user_id)
     
     message_data = {
         'user_id': user_id,
@@ -341,8 +345,11 @@ async def handle_video_note_message(message: types.Message):
     if await handle_buttons(message):
         return
     
+    if not await check_command_access(message):
+        return
+    
     user_id = message.from_user.id
-    user_level = user_levels.get(user_id, 0)
+    user_level = get_user_level(user_id)
     
     message_data = {
         'user_id': user_id,
@@ -361,8 +368,11 @@ async def handle_sticker_message(message: types.Message):
     if await handle_buttons(message):
         return
     
+    if not await check_command_access(message):
+        return
+    
     user_id = message.from_user.id
-    user_level = user_levels.get(user_id, 0)
+    user_level = get_user_level(user_id)
     
     message_data = {
         'user_id': user_id,
@@ -382,8 +392,11 @@ async def handle_document_message(message: types.Message):
     if await handle_buttons(message):
         return
     
+    if not await check_command_access(message):
+        return
+    
     user_id = message.from_user.id
-    user_level = user_levels.get(user_id, 0)
+    user_level = get_user_level(user_id)
     
     message_data = {
         'user_id': user_id,
@@ -410,7 +423,7 @@ async def handle_moderation(callback: types.CallbackQuery):
             return
         
         moderator_id = callback.from_user.id
-        moderator_level = user_levels.get(moderator_id, 0)
+        moderator_level = get_user_level(moderator_id)
         moderator_username = callback.from_user.username or "неизвестно"
         
         if message_data['user_id'] == moderator_id:
@@ -422,6 +435,7 @@ async def handle_moderation(callback: types.CallbackQuery):
             return
         
         approved = action == "approve"
+        moderation_time = 0  # Можно добавить расчет времени
         
         if approved:
             try:
@@ -437,7 +451,7 @@ async def handle_moderation(callback: types.CallbackQuery):
                         caption=message_data.get('caption', '📨 Анонимное фото')
                     )
                 
-                update_moderator_stats(moderator_id, 'approve')
+                update_moderator_stats(moderator_id, 'approve', moderation_time)
                 message_content = message_data['content'] if message_data['type'] == 'text' else f"{message_data['type']} сообщение"
                 await send_moderation_log(
                     moderator_username, moderator_id, message_content, 
@@ -449,7 +463,7 @@ async def handle_moderation(callback: types.CallbackQuery):
                 await callback.answer("Ошибка публикации")
                 return
         else:
-            update_moderator_stats(moderator_id, 'reject')
+            update_moderator_stats(moderator_id, 'reject', moderation_time)
             message_content = message_data['content'] if message_data['type'] == 'text' else f"{message_data['type']} сообщение"
             await send_moderation_log(
                 moderator_username, moderator_id, message_content,
@@ -472,6 +486,7 @@ async def handle_moderation(callback: types.CallbackQuery):
         except Exception as e:
             logger.warning(f"Не удалось уведомить пользователя {message_data['user_id']}: {e}")
         
+        update_message_status(message_id, approved, moderation_time)
         delete_message(message_id)
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
@@ -491,67 +506,18 @@ async def handle_punishment_callback(callback: types.CallbackQuery, state: FSMCo
         target_id = int(target_id)
         
         moderator_id = callback.from_user.id
-        moderator_level = user_levels.get(moderator_id, 0)
+        moderator_level = get_user_level(moderator_id)
         
         if moderator_level < 2:
             await callback.answer("❌ У вас нет прав для выдачи наказаний")
             return
         
-        await state.update_data(
-            action=action,
-            target_id=target_id,
-            moderator_id=moderator_id
-        )
+        await state.update_data({
+            'punishment_type': action,
+            'target_id': target_id,
+            'moderator_id': moderator_id
+        })
         
         await callback.message.answer("📝 Укажите причину наказания:")
         await state.set_state(PunishmentStates.waiting_for_reason)
-        await callback.answer()
-        
-    except Exception as e:
-        logger.error(f"Ошибка обработки наказания: {e}")
-
-@error_handler
-async def handle_punishment_reason(message: types.Message, state: FSMContext):
-    try:
-        data = await state.get_data()
-        action = data.get('action')
-        target_id = data.get('target_id')
-        moderator_id = data.get('moderator_id')
-        reason = message.text
-        
-        moderator_username = message.from_user.username or "неизвестно"
-        
-        target_username = "неизвестно"
-        try:
-            user = await message.bot.get_chat(target_id)
-            target_username = f"@{user.username}" if user.username else f"ID: {target_id}"
-        except:
-            target_username = f"ID: {target_id}"
-        
-        if action == "mute":
-            add_punishment(target_id, 'mute', reason)
-            await message.answer("🔇 Заглушка выдана")
-        elif action == "warn":
-            add_punishment(target_id, 'warning', reason)
-            add_warning(target_id)
-            await message.answer("⚠️ Предупреждение выдано")
-        elif action == "ban":
-            add_punishment(target_id, 'ban', reason)
-            await message.answer("🚫 Блокировка выдана")
-        
-        punishment_type = "mute" if action == "mute" else "warning" if action == "warn" else "ban"
-        await send_punishment_log(
-            moderator_username,
-            moderator_id,
-            target_username,
-            target_id,
-            punishment_type,
-            reason
-        )
-        
-        await state.clear()
-        
-    except Exception as e:
-        logger.error(f"Ошибка обработки причины наказания: {e}")
-        await message.answer("❌ Произошла ошибка при выдаче наказания")
-        await state.clear()
+        await c
