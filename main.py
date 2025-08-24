@@ -7,7 +7,8 @@ from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.types import ErrorEvent
 
 from config import Config
-from storage import user_levels, set_user_level, init_punishment_system, load_initial_data
+from storage import user_levels, set_user_level, init_punishment_system, load_initial_data, cleanup_old_data
+from database import init_database, db
 from filters import RateLimitFilter
 from handlers import send_error_log
 
@@ -16,7 +17,8 @@ from commands import (
     cmd_start, cmd_pending, cmd_checkprofile, cmd_setlevel, 
     cmd_getid, cmd_help, cmd_stats, cmd_users, cmd_mods,
     cmd_settings, cmd_backup, cmd_status, cmd_emergency,
-    cmd_reports, handle_cancel, handle_new_message, handle_admin_callback
+    cmd_reports, handle_cancel, handle_new_message, handle_admin_callback,
+    register_commands  # Новая функция для регистрации команд
 )
 
 from handlers import (
@@ -41,40 +43,117 @@ async def global_error_handler(event: ErrorEvent):
     await send_error_log("Global Error", str(event.exception))
 
 async def background_tasks():
-    """Фоновые задачи"""
+    """Фоновые задачи для обслуживания системы"""
     while True:
         try:
-            # Здесь можно добавить периодические задачи
-            # например, очистку кэша, проверку здоровья и т.д.
-            await asyncio.sleep(300)  # Каждые 5 минут
+            # Очистка старых данных из базы
+            cleanup_old_data()
+            logger.info("✅ Фоновая очистка данных выполнена")
+            
+            # Проверка соединения с базой данных
+            if db and not db.connection.is_connected():
+                logger.warning("📡 Переподключение к MySQL...")
+                db.connect()
+            
+            await asyncio.sleep(3600)  # Каждый час
+        
         except Exception as e:
-            logger.error(f"Background task error: {e}")
+            logger.error(f"Ошибка в фоновой задаче: {e}")
+            await asyncio.sleep(300)  # Ждем 5 минут при ошибке
+
+async def database_health_check():
+    """Проверка здоровья базы данных"""
+    while True:
+        try:
+            if db and db.connection.is_connected():
+                # Простая проверка запросом
+                with db.get_cursor() as cursor:
+                    cursor.execute("SELECT 1")
+                    logger.debug("✅ Проверка базы данных: OK")
+            else:
+                logger.warning("❌ База данных не подключена")
+                
+            await asyncio.sleep(300)  # Проверка каждые 5 минут
+            
+        except Exception as e:
+            logger.error(f"Ошибка проверки здоровья БД: {e}")
             await asyncio.sleep(60)
+
+async def startup_tasks():
+    """Задачи выполняемые при запуске бота"""
+    logger.info("🚀 Выполнение задач запуска...")
+    
+    # Загрузка данных из базы
+    try:
+        load_initial_data()
+        logger.info(f"✅ Загружено {len(user_levels)} пользователей")
+    except Exception as e:
+        logger.error(f"❌ Ошибка загрузки данных: {e}")
+    
+    # Установка уровней по умолчанию
+    try:
+        set_user_level(Config.MODERATOR_ID, 1)
+        set_user_level(Config.OWNER_ID, 3)
+        logger.info("✅ Уровни пользователей установлены")
+    except Exception as e:
+        logger.error(f"❌ Ошибка установки уровней: {e}")
+    
+    # Очистка старых данных
+    try:
+        cleanup_old_data()
+        logger.info("✅ Очистка старых данных выполнена")
+    except Exception as e:
+        logger.error(f"❌ Ошибка очистки данных: {e}")
+
+async def shutdown_tasks():
+    """Задачи выполняемые при выключении бота"""
+    logger.info("🛑 Выполнение задач выключения...")
+    
+    # Закрытие соединения с базой
+    if db:
+        db.disconnect()
+        logger.info("✅ Соединение с базой данных закрыто")
+    
+    # Остановка системы наказаний
+    if 'punishment_system' in globals():
+        await punishment_system.stop()
+        logger.info("✅ Система наказаний остановлена")
 
 async def main():
     try:
+        # Валидация конфигурации
         Config.validate()
+        logger.info("✅ Конфигурация проверена")
         
-        # Используем Redis вместо MemoryStorage
+        # Инициализация базы данных MySQL
+        if not init_database(
+            Config.MYSQL_HOST,
+            Config.MYSQL_USER, 
+            Config.MYSQL_PASSWORD,
+            Config.MYSQL_DATABASE
+        ):
+            logger.error("❌ Не удалось подключиться к MySQL")
+            return
+        
+        logger.info("✅ MySQL подключена успешно")
+        
+        # Инициализация Redis для FSM
         storage = RedisStorage.from_url('redis://localhost:6379/0')
         bot = Bot(token=Config.BOT_TOKEN)
         dp = Dispatcher(storage=storage)
         
-        # Загружаем данные из Redis
-        load_initial_data()
+        # Задачи при запуске
+        await startup_tasks()
         
-        # Инициализируем системы
+        # Инициализация систем
         punishment_system = init_punishment_system(bot)
         await punishment_system.start()
+        logger.info("✅ Система наказаний запущена")
         
-        # Устанавливаем уровни пользователей
-        set_user_level(Config.MODERATOR_ID, 1)
-        set_user_level(Config.OWNER_ID, 3)
-        
-        # Регистрируем обработчики
+        # Регистрируем обработчики ошибок
         dp.errors.register(global_error_handler)
         
-        # Команды
+        # Регистрируем основные команды
         dp.message.register(cmd_start, Command("start"))
         dp.message.register(cmd_pending, Command("pending"))
         dp.message.register(cmd_checkprofile, Command("checkprofile"))
@@ -89,6 +168,9 @@ async def main():
         dp.message.register(cmd_status, Command("status"))
         dp.message.register(cmd_emergency, Command("emergency"))
         dp.message.register(cmd_reports, Command("reports"))
+
+        # Регистрируем дополнительные команды
+        register_commands(dp)
 
         # Обработчики сообщений
         dp.message.register(handle_cancel, F.text == "✖️ Отменить")
@@ -115,17 +197,29 @@ async def main():
 
         # Запускаем фоновые задачи
         asyncio.create_task(background_tasks())
+        asyncio.create_task(database_health_check())
         
-        logger.info("Бот запущен успешно!")
-        logger.info(f"Используется Redis storage")
+        logger.info("🤖 Бот запущен успешно!")
+        logger.info(f"📊 Пользователей в памяти: {len(user_levels)}")
+        logger.info(f"📨 Сообщений в очереди: {len(getattr(storage, 'pending_messages', {}))}")
+        logger.info(f"🗄️  База данных: {Config.MYSQL_DATABASE} на {Config.MYSQL_HOST}")
         
+        # Запускаем поллинг
         await dp.start_polling(bot)
         
     except Exception as e:
-        logger.critical(f"Failed to start bot: {e}")
-        if 'punishment_system' in locals():
-            await punishment_system.stop()
+        logger.critical(f"❌ Не удалось запустить бота: {e}", exc_info=True)
+        await shutdown_tasks()
         sys.exit(1)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Обработка graceful shutdown
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("🛑 Бот остановлен пользователем")
+        asyncio.run(shutdown_tasks())
+    except Exception as e:
+        logger.critical(f"❌ Критическая ошибка: {e}", exc_info=True)
+        asyncio.run(shutdown_tasks())
+        sys.exit(1)
